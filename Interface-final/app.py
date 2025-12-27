@@ -9,12 +9,13 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Tuple
-
+import time
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
+import streamlit.components.v1 as components
 
 # 3rd-party grid
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
@@ -25,10 +26,28 @@ from utils import (
     save_json, jaccard
 )
 from genetic_algorithm import GeneticAlgorithmFS, GAConfig
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "patients.db"
 
+def db_connect():
+    return sqlite3.connect(str(DB_PATH), check_same_thread=False)
+st.caption(f"DB in use: {DB_PATH}")
 
 # --------------------- Page setup ---------------------
 st.set_page_config(page_title="Breast Cancer – GA Feature Selection", layout="wide")
+
+# --- run-after-rerun scroll to top ---
+if st.session_state.get("__scroll_top_next_run", False):
+    components.html(
+        """
+        <script>
+          setTimeout(() => { window.scrollTo(0,0); }, 50);
+        </script>
+        """,
+        height=0,
+    )
+    st.session_state["__scroll_top_next_run"] = False
+    
 st.title("Breast Cancer – GA Feature Selection App")
 #    "Improved GA with inner-CV composite fitness. "
 #   "Fitness = 0.5 × (Mean CV_Accuracy + Mean CV_F1) − α × (#selected / total_features). "
@@ -106,10 +125,9 @@ if lock_seed:
 
 
 # --------------------- SQLite (DB) ---------------------
-DB_PATH = "patients.db"
-
-def db_connect():
-    return sqlite3.connect(DB_PATH)
+from pathlib import Path
+import sqlite3
+import streamlit as st
 
 def db_init():
     with db_connect() as con:
@@ -153,21 +171,32 @@ def db_update(row_id: int, label: int, features: Dict[str, Any], notes: str = ""
     except Exception as e:
         return False, f"Error: {e}"
 
-def db_delete(row_id: int) -> Tuple[bool, str]:
+def db_delete(row_id: int):
     try:
         with db_connect() as con:
             cur = con.cursor()
-            cur.execute("DELETE FROM patients WHERE id=?", (int(row_id),))
+
+            cur.execute("DELETE FROM patients WHERE id = ?", (int(row_id),))
             con.commit()
-        return True, "Deleted."
+
+            # number of rows deleted (SQLite reliable)
+            cur.execute("SELECT changes()")
+            deleted = cur.fetchone()[0]
+
+            if deleted == 0:
+                return False, f"No row deleted. (id={row_id}) not found in DB."
+            return True, f"Deleted row id={row_id}"
     except Exception as e:
         return False, f"Error: {e}"
 
 def db_fetch_all() -> pd.DataFrame:
     with db_connect() as con:
-        df = pd.read_sql_query("SELECT id, patient_id, label, features_json, notes, created_at FROM patients ORDER BY id DESC", con)
+        df = pd.read_sql_query(
+            "SELECT id, patient_id, label, features_json, notes, created_at "
+            "FROM patients ORDER BY id DESC",
+            con
+        )
     return df
-
 
 # ---------- Build BASE & ADDED dataframes ----------
 def build_base_df() -> pd.DataFrame:
@@ -206,6 +235,23 @@ def merged_view() -> pd.DataFrame:
     df = pd.concat([add, base], ignore_index=True)
     return df
 
+def ui_refresh(grid_key: str = "db_grid"):
+    # 1) reload data from DB (THIS is the missing part)
+    st.session_state["full_df"] = merged_view()
+
+    # 2) clear action/pending
+    st.session_state[f"{grid_key}__pending_action"] = None
+    st.session_state[f"{grid_key}__pending_row"] = None
+    st.session_state[f"{grid_key}__last_token"] = ""
+
+    # 3) force AgGrid rebuild
+    st.session_state.setdefault(f"{grid_key}__grid_version", 0)
+    st.session_state[f"{grid_key}__grid_version"] += 1
+    st.session_state["__scroll_top_next_run"] = True
+    # 4) rerun
+    st.rerun()
+
+
 
 # ---------- AgGrid control table with inline icons ----------
 def paginated_actions_table(df: pd.DataFrame, page_size: int = 20, key: str = "db_grid"):
@@ -217,6 +263,8 @@ def paginated_actions_table(df: pd.DataFrame, page_size: int = 20, key: str = "d
       - Base rows are view-only; Added rows editable/deletable
       - Delete confirmation uses red background (st.error)
     """
+
+
     if df is None or len(df) == 0:
         st.info("No data to show.")
         return
@@ -285,7 +333,8 @@ def paginated_actions_table(df: pd.DataFrame, page_size: int = 20, key: str = "d
     gb.configure_column("Control", cellRenderer=control_renderer)
 
     grid_options = gb.build()
-
+    st.session_state.setdefault(f"{key}__grid_version", 0)
+    grid_version = st.session_state[f"{key}__grid_version"]
     grid = AgGrid(
         data,
         gridOptions=grid_options,
@@ -296,7 +345,7 @@ def paginated_actions_table(df: pd.DataFrame, page_size: int = 20, key: str = "d
         height=560,
         allow_unsafe_jscode=True,
         theme="material",
-        key=f"{key}_ag",
+        key=f"{key}_ag_v{grid_version}",
     )
 
     df_after = grid["data"] if "data" in grid else pd.DataFrame()
@@ -317,8 +366,21 @@ def paginated_actions_table(df: pd.DataFrame, page_size: int = 20, key: str = "d
                     act_typ = str(latest["__action"])
                     act_row = latest.to_dict()
 
+    # --- Persist last action so Streamlit reruns (button click) won't lose it ---
+    st.session_state.setdefault(f"{key}__pending_action", None)
+    st.session_state.setdefault(f"{key}__pending_row", None)
+
+    if act_row is not None and act_typ is not None:
+        st.session_state[f"{key}__pending_action"] = act_typ
+        st.session_state[f"{key}__pending_row"] = act_row
+    else:
+        # Use pending if available
+        act_typ = st.session_state.get(f"{key}__pending_action")
+        act_row = st.session_state.get(f"{key}__pending_row")
+
     if act_row is None or act_typ is None:
         return
+
 
     # Actions as inline expanders
     if act_typ == "view":
@@ -359,26 +421,36 @@ def paginated_actions_table(df: pd.DataFrame, page_size: int = 20, key: str = "d
                 else:
                     ok, msg = db_update(int(row_id), int(new_label), new_feats, notes_edit)
                     (st.success if ok else st.error)(msg)
+                    if ok:
+                      time.sleep(1.5)  
+                      ui_refresh("db_grid")
 
     elif act_typ == "delete":
-        with st.expander("Confirm deletion", expanded=True):
-            pid = act_row.get("patient_id")
-            st.error(f'Are you sure you want to delete the patient "{pid}" details from the database? This action cannot be undone.')
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Yes, delete", key=f"yes_del_{pid}"):
-                    if act_row.get("source") == "Base":
-                        st.error("Base rows are locked (cannot delete).")
-                    else:
-                        row_id = act_row.get("id")
-                        if row_id is None or (isinstance(row_id, float) and np.isnan(row_id)):
-                            st.error("Invalid row id for deletion.")
-                        else:
-                            ok, msg = db_delete(int(row_id))
-                            (st.success if ok else st.error)(msg)
-            with c2:
-                st.button("Cancel", key=f"cancel_del_{pid}")
+     with st.expander("Confirm deletion", expanded=True):
+        pid = act_row.get("patient_id")
+        row_id = act_row.get("id")
+        tok = act_row.get("__token", "t0")
 
+        st.error(f'Are you sure you want to delete the patient "{pid}" details from the database? This action cannot be undone.')
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Yes, delete", key=f"yes_del_{row_id}_{tok}"):
+                if act_row.get("source") == "Base":
+                    st.error("Base rows are locked (cannot delete).")
+                else:
+                    ok, msg = db_delete(int(float(row_id)))
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.session_state[f"{key}__pending_action"] = None
+                        st.session_state[f"{key}__pending_row"] = None
+                        time.sleep(1.5)
+                        ui_refresh("db_grid")
+        with c2:
+            if st.button("Cancel", key=f"cancel_del_{row_id}_{tok}"):
+                st.session_state[f"{key}__pending_action"] = None
+                st.session_state[f"{key}__pending_row"] = None
+                st.rerun()
 
 # --------------------- Tabs ---------------------
 tabs = st.tabs(["Dataset / DB", "Run GA", "Baselines", "Results & Plots", "Stability", "Export"])
@@ -393,12 +465,18 @@ with tabs[0]:
     st.write(f"Base WDBC: 569 rows | Added: {len(added_df)} | Displayed: {569 + len(added_df)}")
 
     # Full merged view
-    full_df = merged_view()
-    paginated_actions_table(full_df, page_size=20, key="db_grid")
+    if "full_df" not in st.session_state:
+     st.session_state["full_df"] = merged_view()
+
+    paginated_actions_table(st.session_state["full_df"], page_size=20, key="db_grid")
 
     st.markdown("---")
     st.subheader("➕ Add new sample")
-    expander = st.expander("Add (Manual 30 features / CSV)", expanded=False)
+    st.session_state.setdefault("add_expanded", False)
+    st.session_state.setdefault("add_box_ver", 0)
+
+    expander_title = f"Add (Manual 30 features / CSV)"
+    expander = st.expander(expander_title, expanded=st.session_state["add_expanded"])
     with expander:
         mode = st.radio(
             "Input mode",
@@ -427,6 +505,11 @@ with tabs[0]:
             if submitted:
                 ok, msg = db_insert(patient_id, label, values_30, notes)
                 (st.success if ok else st.error)(msg)
+                if ok:
+                   st.session_state["add_expanded"] = False
+                   st.session_state["add_box_ver"] += 1
+                   time.sleep(1.5)
+                   ui_refresh("db_grid")
 
         else:
             st.info("CSV must include `patient_id`, `label`, and any subset/all of the 30 feature columns (use WDBC names).")
@@ -448,6 +531,11 @@ with tabs[0]:
                             ok, _ = db_insert(pid, label_val, feats, "")
                             added += 1 if ok else 0
                         st.success(f"Imported: {added} | Skipped/Duplicates: {skipped}")
+                        st.session_state["add_expanded"] = False
+                        st.session_state["add_box_ver"] += 1
+                        time.sleep(1.5)
+                        ui_refresh("db_grid")
+
                 except Exception as e:
                     st.error(f"Import failed: {e}")
 
