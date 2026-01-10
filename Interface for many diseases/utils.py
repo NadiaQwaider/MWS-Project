@@ -340,36 +340,59 @@ def jaccard(a: List[int], b: List[int]) -> float:
 # Helper Methods
 # ================================================================
 
-def eval_model(
-    model,
-    name: str,
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-    prefix: str = ""
-):
-    model.fit(X_train, y_train)
+def eval_model(model, name, Xtr, Xte, ytr, yte, tag=""):
+    model.fit(Xtr, ytr)
 
-    y_pred = model.predict(X_test)
+    y_pred = model.predict(Xte)
 
+    # prob for ROC-AUC if available
     y_prob = None
     if hasattr(model, "predict_proba"):
-        y_prob = model.predict_proba(X_test)[:, 1]
+        y_prob = model.predict_proba(Xte)[:, 1]
+    elif hasattr(model, "decision_function"):
+        # optional: keep None (no ROC-AUC) or calibrate scores later
+        y_prob = None
 
-    acc = accuracy_score(y_test, y_pred)
-    f1  = f1_score(y_test, y_pred, average="macro")
+    # ---- Core metrics ----
+    acc = accuracy_score(yte, y_pred)
 
-    auc = None
-    if y_prob is not None:
-        auc = roc_auc_score(y_test, y_prob)
+    # Macro (balanced across classes)
+    f1_macro = f1_score(yte, y_pred, average="macro", zero_division=0)
+    prec_macro = precision_score(yte, y_pred, average="macro", zero_division=0)
+    rec_macro  = recall_score(yte, y_pred, average="macro", zero_division=0)
+
+    # Positive-class (clinical)
+    # works only if yte is binary {0,1}
+    if len(np.unique(yte)) == 2:
+        prec_pos = precision_score(yte, y_pred, average="binary", pos_label=1, zero_division=0)
+        rec_pos  = recall_score(yte, y_pred, average="binary", pos_label=1, zero_division=0)
+        f1_pos   = f1_score(yte, y_pred, average="binary", pos_label=1, zero_division=0)
+    else:
+        prec_pos = None
+        rec_pos  = None
+        f1_pos   = None
+
+    roc = roc_auc_score(yte, y_prob) if (y_prob is not None and len(np.unique(yte)) == 2) else None
 
     return {
-        "name": f"{prefix}{name}",
-        "accuracy": acc,
-        "f1": f1,
-        "roc_auc": auc,
-        "y_pred": y_pred,
-        "y_prob": y_prob,
+        "name": name,
+        "accuracy": float(acc),
+
+        # Macro metrics
+        "f1_macro": float(f1_macro),
+         #"precision_macro": float(prec_macro),
+         #"recall_macro": float(rec_macro),
+
+        # Positive-class metrics (Sensitivity = recall_pos)
+        "precision_pos": (None if prec_pos is None else float(prec_pos)),
+        "recall_pos":    (None if rec_pos  is None else float(rec_pos)),
+        # "f1_pos":        (None if f1_pos   is None else float(f1_pos)),
+
+        "roc_auc": (None if roc is None else float(roc)),
+
+        # keep these if you need them elsewhere, but you can hide them in UI
+        "y_pred": y_pred.tolist(),
+        "y_prob": (None if y_prob is None else y_prob.tolist()),
     }
+
 

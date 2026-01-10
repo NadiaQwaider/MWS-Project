@@ -900,7 +900,7 @@ with tabs[2]:
 
 
 
-# ============ General Dataset Runner tab ============
+# ============ General Dataset Runner tab ============ #
 with tabs[3]:
     st.header("General Medical Dataset Runner (Upload & Experiment)")
     st.caption("Upload any medical CSV, select target, run baselines and GA on your dataset (Binary supported).")
@@ -917,9 +917,71 @@ with tabs[3]:
     st.subheader(f"Dataset: {up.name}")
     df_raw = pd.read_csv(up)
 
-    # Clean common junk columns (Excel artifacts)
-    df_raw = df_raw.loc[:, ~df_raw.columns.astype(str).str.match(r"^Unnamed")]
-    df_raw = df_raw.dropna(axis=1, how="all")
+    # -------------------- Dataset summary --------------------
+    # Clean common junk columns (Excel artifacts) ✅ أولاً
+    df0 = df_raw.copy()
+    df0 = df0.loc[:, ~df0.columns.astype(str).str.match(r"^Unnamed", na=False)]
+    df0 = df0.dropna(axis=1, how="all")
+
+    # -------------------- Dataset summary (NO target selection needed) --------------------
+    import re
+
+    def _is_id_like(colname: str) -> bool:
+        cl = str(colname).strip().lower()
+        return (
+            cl in ["id", "patient_id", "case_id", "record_id", "sample_id"]
+            or (cl.endswith("id") and cl not in ["diagnosis"])  # keep "diagnosis" safe
+        )
+
+    def _is_output_like(colname: str) -> bool:
+        cl = str(colname).strip().lower()
+        # keywords that typically mean "target/output"
+        keywords = [
+            "target", "label", "class", "outcome", "output", "result", "y",
+            "diagnosis", "disease", "status"
+        ]
+        return any(k == cl or cl.startswith(k + "_") or cl.endswith("_" + k) for k in keywords)
+
+    def _normalize_missing(df: pd.DataFrame) -> pd.DataFrame:
+        # ✅ catches "-", " - ", spaces, em-dash, NA, empty strings
+        return df.replace(
+            to_replace=[
+                r"^\s*-\s*$",
+                r"^\s*—\s*$",
+                r"^\s*NA\s*$",
+                r"^\s*N/A\s*$",
+                r"^\s*$",
+            ],
+            value=np.nan,
+            regex=True
+        )
+
+    df_missing = _normalize_missing(df0)
+
+    # determine "feature columns" automatically
+    feature_cols_auto = [
+        c for c in df_missing.columns
+        if (not _is_id_like(c)) and (not _is_output_like(c))
+    ]
+
+    n_samples = int(df_missing.shape[0])
+    n_features = int(len(feature_cols_auto))
+
+    # ✅ missing count on FEATURES only
+    samples_with_missing = int(df_missing[feature_cols_auto].isna().any(axis=1).sum()) if n_features > 0 else 0
+
+    st.markdown(
+        f"""
+    **Dataset summary:**  
+    - **Samples:** {n_samples}  
+    - **Features:** {n_features}  
+    - **Samples with missing values:** {samples_with_missing} ({samples_with_missing / max(1, n_samples):.1%})
+    """
+    )
+
+    # Use df0 afterwards in the page
+    df_raw = df0
+
 
     # -------------------- Preview with pagination (10 rows/page) --------------------
     st.write("Preview (paged):")
@@ -942,7 +1004,7 @@ with tabs[3]:
 
     target_col = st.selectbox("Target column", options=list(df_raw.columns), key="target_col_general")
 
-    # Binary only (avoid any accidental multiclass path)
+    # Binary only
     task_type = "binary"
 
     uniq = list(pd.unique(df_raw[target_col].dropna()))
@@ -967,7 +1029,7 @@ with tabs[3]:
             st.warning("Manual mode selected but no feature columns chosen. Please select at least 1 feature.")
             st.stop()
 
-    # ✅ Keep Recall option in the UI (you asked to keep it)
+    # ✅ keep recall option
     metric_priority = st.selectbox(
         "Metric priority (affects GA fitness)",
         ["Balanced (Accuracy+F1)", "Recall-focused (reduce FN)"],
@@ -977,6 +1039,21 @@ with tabs[3]:
     seed_general = st.number_input("Random seed", value=int(seed), step=1, key="seed_general")  # default from sidebar seed
 
     # -------------------- Helpers --------------------
+    def _safe_to_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Convert all columns to numeric where possible; non-numeric -> NaN.
+        Handles ' - ', '-', '—', empty strings, etc.
+        """
+        out = df.copy()
+        # normalize common missing-like tokens
+        out = out.replace(
+            to_replace=[r"^\s*-\s*$", r"^\s*—\s*$", r"^\s*NA\s*$", r"^\s*N/A\s*$", r"^\s*$"],
+            value=np.nan,
+            regex=True
+        )
+        for c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+        return out
 
     def _clean_and_prepare_binary(df_in: pd.DataFrame, target: str, pos_class, feat_mode: str, manual_cols):
         """
@@ -984,10 +1061,11 @@ with tabs[3]:
         """
         df = df_in.copy()
 
-        # 1) treat '-' / ' - ' as missing
-        df = df.replace(["-", " - ", "—", "NA", "N/A", ""], np.nan)
+        # Drop junk columns again (safe)
+        df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")]
+        df = df.dropna(axis=1, how="all")
 
-        # 2) drop ID-like columns automatically (do NOT let GA use them)
+        # Drop ID-like columns (do NOT let GA use them)
         id_like = []
         for c in df.columns:
             cl = str(c).strip().lower()
@@ -997,42 +1075,33 @@ with tabs[3]:
                 id_like.append(c)
         df = df.drop(columns=id_like, errors="ignore")
 
-        # 3) Build y (binary: positive_class => 1, else 0)
+        # Build y (binary)
         y_raw = df[target]
         y = (y_raw == pos_class).astype(int).to_numpy()
 
-        # 4) Feature columns
+        # Choose feature columns
         if feat_mode == "manual" and manual_cols is not None:
             feat_cols = [c for c in manual_cols if c != target]
+            Xdf = df[feat_cols].copy()
+            Xdf = _safe_to_numeric_frame(Xdf)
         else:
-            # numeric_only
+            # numeric_only: take all columns except target then coerce numeric
             feat_cols = [c for c in df.columns if c != target]
-            # convert everything to numeric; non-numeric becomes NaN
-            for c in feat_cols:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            feat_cols = list(df[feat_cols].select_dtypes(include=["number"]).columns)
+            Xdf = df[feat_cols].copy()
+            Xdf = _safe_to_numeric_frame(Xdf)
+
+            # keep only numeric columns that actually exist after coercion
+            feat_cols = list(Xdf.columns)
 
         if len(feat_cols) == 0:
-            raise ValueError("No numeric feature columns found after cleaning. Try manual selection or check your file.")
+            raise ValueError("No feature columns found. Try manual selection or check your file.")
 
-        Xdf = df[feat_cols].copy()
-
-        # 5) convert numeric (coerce) + impute
-        for c in Xdf.columns:
-            Xdf[c] = pd.to_numeric(Xdf[c], errors="coerce")
-
+        # Impute missing numeric values
         imputer = SimpleImputer(strategy="median")
         X = imputer.fit_transform(Xdf)
 
         feat_names_local = list(map(str, feat_cols))
         return X.astype(float), y.astype(int), feat_names_local
-
-    def _feature_hint(name: str, X_tr: np.ndarray, col_idx: int) -> str:
-        """Small hint printed next to feature name (generic & always valid)."""
-        col = X_tr[:, col_idx]
-        mu = float(np.nanmean(col))
-        sd = float(np.nanstd(col))
-        return f"(μ={mu:.3f}, σ={sd:.3f})"
 
     def plot_ga_curve(history, title="GA Fitness Evolution (Best per Generation)"):
         if history is None or not isinstance(history, (list, tuple)) or len(history) < 2:
@@ -1076,9 +1145,68 @@ with tabs[3]:
         st.pyplot(fig, use_container_width=True)
         return fig
 
+    def _auto_compare_text(baseline_view: pd.DataFrame, ga_view: pd.DataFrame) -> str:
+        """
+        Creates a short academic English text comparing All vs GA using the best ROC-AUC if available,
+        otherwise F1-macro, otherwise Accuracy.
+        Assumes both tables include columns like: Model, Accuracy, F1-macro, ROC-AUC (case-insensitive tolerated).
+        """
+        def _pick_metric(df):
+            cols = {c.lower(): c for c in df.columns}
+            for key in ["roc-auc", "roc_auc", "rocauc", "roc a uc", "roc-auc "]:
+                if key in cols:
+                    return cols[key], "ROC-AUC"
+            if "f1-macro" in cols: return cols["f1-macro"], "F1-macro"
+            if "accuracy" in cols: return cols["accuracy"], "Accuracy"
+            return None, "Metric"
+
+        mcol_b, mname = _pick_metric(baseline_view)
+        mcol_g, _ = _pick_metric(ga_view)
+        if mcol_b is None or mcol_g is None:
+            return "No comparable metric columns found to generate an interpretation."
+
+        # pick best model in each table
+        b_best = baseline_view.loc[baseline_view[mcol_b].astype(float).idxmax()]
+        g_best = ga_view.loc[ga_view[mcol_g].astype(float).idxmax()]
+
+        b_val = float(b_best[mcol_b])
+        g_val = float(g_best[mcol_g])
+
+        diff = g_val - b_val
+        absd = abs(diff)
+
+        model_b = str(b_best.get("Model", "Best baseline model"))
+        model_g = str(g_best.get("Model", "Best GA model"))
+
+        # main sentence
+        if diff >= 0:
+            line1 = (f"Using the GA-selected feature subset, {model_g} achieved a higher {mname} "
+                     f"({g_val:.3f}) compared to the best baseline with all features ({model_b}, {b_val:.3f}), "
+                     f"indicating effective feature selection and improved generalization.")
+        else:
+            line1 = (f"Using the GA-selected feature subset, {model_g} achieved a slightly lower {mname} "
+                     f"({g_val:.3f}) compared to the best baseline with all features ({model_b}, {b_val:.3f}).")
+
+        # add nuance when marginal change
+        if absd <= 0.01 and diff < 0:
+            line2 = (
+                "This marginal reduction is commonly observed in medical datasets such as Heart Disease or Diabetes, "
+                "where predictive information is distributed across multiple weakly-informative features, "
+                "making strict feature reduction more challenging without minor performance trade-offs."
+            )
+        elif absd <= 0.01 and diff >= 0:
+            line2 = (
+                "The near-identical performance suggests successful dimensionality reduction without degradation, "
+                "which supports the practical value of using fewer features while maintaining comparable predictive quality."
+            )
+        else:
+            line2 = ""
+
+        return line1 + ("\n\n" + line2 if line2 else "")
+
     # -------------------- Run Experiment --------------------
     if st.button("Run Experiment", type="primary", key="run_exp_general"):
-        # 1) Prepare dataset (same preprocessing idea as Run GA: clean -> numeric -> impute)
+        # 1) Prepare dataset
         try:
             X2, y2, feat_names_local = _clean_and_prepare_binary(
                 df_in=df_raw,
@@ -1091,9 +1219,24 @@ with tabs[3]:
             st.error(f"Dataset preparation failed: {e}")
             st.stop()
 
-        # 2) Outer split (✅ fixed 70/30 like Run GA)
+        # 2) Outer split (fixed 70/30 like Run GA)
         X_tr2, X_te2, y_tr2, y_te2 = outer_split(X2, y2, test_size=TEST_SIZE, seed=int(seed_general))
 
+        st.markdown("""
+        ### 🔍 Evaluation Metrics – How to Read This Table
+
+        - **Accuracy**: Overall proportion of correctly classified samples (both positive and negative).  
+
+        - **F1 (Macro)**: Harmonic mean of precision and recall, averaged equally across classes.  
+
+        - **Precision (Positive)**: Among samples predicted as *positive*, the proportion that are truly positive.  
+        High precision indicates fewer false positives.
+
+        - **Recall (Positive / Sensitivity)**: Proportion of actual positive cases correctly identified.  
+        High recall means fewer missed disease cases.
+
+        - **ROC-AUC**: Measures the model’s ability to discriminate between positive and negative classes across all thresholds.  
+        """)
         # 3) Baselines (All features)
         st.subheader("Baselines (All features)")
         lr_all = Pipeline([("scaler", StandardScaler()), ("lr", LogisticRegression(max_iter=5000))])
@@ -1110,7 +1253,7 @@ with tabs[3]:
 
         st.divider()
 
-        # 4) GA Feature Selection (✅ same GAConfig settings style as Run GA)
+        # 4) GA Feature Selection (same GAConfig style as Run GA)
         st.subheader("GA Feature Selection + Baselines on selected features")
 
         cfg = GAConfig(
@@ -1121,13 +1264,13 @@ with tabs[3]:
             tournament_k=int(tk),
             elitism=int(elit),
             inner_cv_folds=int(inner_k),
-            lambda_f1=float(0.5),                 # ✅ same as Run GA formula
-            alpha_penalty=float(alpha),           # ✅ same penalty slider as Run GA
+            lambda_f1=float(0.5),
+            alpha_penalty=float(alpha),
             early_stopping_rounds=int(early_stop),
             random_state=int(seed_general),
         )
 
-        # ✅ Keep metric priority behavior (Balanced vs Recall-focused) if your GAConfig supports it
+        # optional weights if your GAConfig supports them
         if metric_priority.startswith("Balanced"):
             if hasattr(cfg, "w_acc"): setattr(cfg, "w_acc", 0.5)
             if hasattr(cfg, "w_f1"): setattr(cfg, "w_f1", 0.5)
@@ -1137,8 +1280,17 @@ with tabs[3]:
             if hasattr(cfg, "w_f1"): setattr(cfg, "w_f1", 0.3)
             if hasattr(cfg, "w_recall_pos"): setattr(cfg, "w_recall_pos", 0.5)
 
+        # Progress indicator (simple: start → finish)
+        progress = st.progress(0)
+        status = st.empty()
+        status.markdown("### ⏳ Running Genetic Algorithm...")
+        progress.progress(10)
+
         ga2 = GeneticAlgorithmFS(X_tr2, y_tr2, cfg)
         mask2, best_fit2, hist2 = ga2.run()
+
+        progress.progress(100)
+        status.success("✅ Genetic Algorithm finished successfully")
 
         idx2 = np.where(np.array(mask2) == 1)[0]
         if idx2.size == 0:
@@ -1146,14 +1298,16 @@ with tabs[3]:
             idx2 = np.array([0])
 
         st.write(f"Selected **{idx2.size}** features:")
-        # ✅ feature name + hint
+
+        # feature name + hint (Mean / Standard Deviation)
         selected_rows = []
         for i in idx2:
             nm = feat_names_local[i]
-            mean_val = np.mean(X_tr2[:, i])
-            std_val  = np.std(X_tr2[:, i])
+            mean_val = float(np.mean(X_tr2[:, i]))
+            std_val  = float(np.std(X_tr2[:, i]))
             hint = f"(Mean={mean_val:.2f}, Standard Deviation={std_val:.2f})"
             selected_rows.append({"feature": f"{nm}  {hint}"})
+
         st.dataframe(pd.DataFrame(selected_rows), use_container_width=True)
 
         # 5) Baselines on GA-selected features
@@ -1172,29 +1326,30 @@ with tabs[3]:
         ga_view = ga_df.drop(columns=["y_pred", "y_prob"], errors="ignore")
         st.dataframe(ga_view, use_container_width=True)
 
-        st.success("Done.")
-
-        # ---- Auto explanatory comparison ----
+        # ---- Auto explanatory comparison (text under GA table, before fitness plot) ----
         st.subheader("Auto Interpretation (Text Summary)")
-        summary_txt = _auto_compare_text(baseline_view, ga_view)
-        st.markdown(summary_txt)
+        st.markdown(_auto_compare_text(baseline_view, ga_view))
 
-
-        # 6) Fitness plot 
+        # 6) Fitness plot (small, clear like thesis)
         st.subheader("GA Fitness Progress")
         st.success(f"Best fitness: {best_fit2:.4f}")
         plot_ga_curve(hist2, title="GA Fitness Evolution (Best per Generation)")
 
-        # 7) ✅ Confusion matrix AFTER the fitness figure (use the same evaluation style as Run GA)
-        # We'll compute it using clf_pipeline() for consistency with your thesis baseline
-        st.subheader("Confusion Matrix (GA-selected features)")
+        # 7) Confusion matrix AFTER the fitness figure
+
+        # Use the same evaluation pipeline used in Run GA for consistency
         model_cm = clf_pipeline()
         model_cm.fit(X_tr_sel2, y_tr2)
         y_pred_cm = model_cm.predict(X_te_sel2)
         y_prob_cm = model_cm.predict_proba(X_te_sel2)[:, 1]
+
         m_cm = compute_metrics(y_te2, y_prob_cm, y_pred_cm)
 
+        # Also show Recall/Precision (positive class) for medical usefulness
+        rec_pos = recall_score(y_te2, y_pred_cm, zero_division=0)
+        prec_pos = precision_score(y_te2, y_pred_cm, zero_division=0)
         plot_confusion_matrix(m_cm.cm, title="Confusion Matrix — class 0 vs class 1 (GA features)")
+
 
 # ============ Results & Plots tab ============ #
 with tabs[4]:
