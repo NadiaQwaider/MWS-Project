@@ -17,9 +17,9 @@ Baseline Models: Logistic Regression (LR), Support Vector Machine (SVM), and Ran
 
 Genetic Algorithm (GA): Applied as a wrapper-based feature selection method using two variants:
 
-    GA Basic: Fitness based on test-set accuracy with a penalty on feature count.
+GA Basic: Fitness based on test-set accuracy with a penalty on feature count.
 
-    GA Improved: Fitness based on Accuracy and F1-macro with internal cross-validation for improved robustness.
+GA Improved: Fitness based on Accuracy and F1-macro with internal cross-validation for improved robustness.
 
 Evaluation:
 Models were assessed using Accuracy, F1-macro, ROC-AUC and Confusion Matrix, with statistical tests used to assess performance differences.
@@ -28,11 +28,11 @@ Models were assessed using Accuracy, F1-macro, ROC-AUC and Confusion Matrix, wit
 
 The framework was evaluated using the Wisconsin Diagnostic Breast Cancer (WDBC) dataset:
 
-    569 samples
+569 samples
 
-    30 numerical features
+30 numerical features
 
-    Binary classification: Benign / Malignant
+Binary classification: Benign / Malignant
 
 4. Interactive Application
 
@@ -40,37 +40,37 @@ An interactive application was developed using Streamlit and SQLite to demonstra
 
 The interface allows users to:
 
-    Enter or upload patient data (CSV batch upload)
+Enter or upload patient data (CSV batch upload)
 
-    Manage data using CRUD operations
+Manage data using CRUD operations
 
-    Run baseline models and GA-based feature selection
+Run baseline models and GA-based feature selection
 
-    Adjust GA hyperparameters
+Adjust GA hyperparameters
 
-    Visualize model performance and selected features
+Visualize model performance and selected features
 
 5. Project Structure
 
 Experimental Scripts (Method Validation):
 
-    00_baseline_all_features.py
+00_baseline_all_features.py
 
-    01_ga_basic.py
+01_ga_basic.py
 
-    02_ga_improved_cv_plots.py
+02_ga_improved_cv_plots.py
 
 Interactive Application (Interface-final):
 
-    app.py
+app.py
 
-    genetic_algorithm.py
+genetic_algorithm.py
 
-    utils.py
+utils.py
 
-    create_db.py
+create_db.py
 
-    patients.db
+patients.db
 
 6. How to Run the Project:
 
